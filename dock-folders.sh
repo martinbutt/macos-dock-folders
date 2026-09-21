@@ -562,9 +562,44 @@ property thumbCacheDir : "$thumb_cache_dir_esc"
 -- stay sharp at a Retina 2x pixel density for the largest icon size
 -- Finder's own grid-icon-size setting realistically produces, small
 -- enough to keep per-item memory in the hundreds-of-KB range instead
--- of the tens-of-MB a native-resolution photo decodes to.
-property thumbCacheSize : 384
+-- of the tens-of-MB a native-resolution photo decodes to. Sized for a
+-- sharp Retina 2x grid icon at Finder's default grid-icon-size setting
+-- (96pt -> 192px); larger than that is a rare custom setting, and with
+-- loaded thumbnails now bounded by maxLoadedThumbnails rather than by
+-- folder size, there's no longer a reason to size this for the largest
+-- plausible setting "just in case" the way there was before that cap
+-- existed.
+property thumbCacheSize : 256
 property isBuildingMenu : false
+-- Real (decoded) thumbnails are loaded only for items currently on
+-- screen, not for the whole folder up front -- everything else shows
+-- the cheap generic per-type icon until it's scrolled into view. These
+-- four track that: itemIconViews/itemHasRealThumb are parallel to
+-- allNames/itemPaths (index i in one is the same item as index i in
+-- the others -- see the note in showFolderMenu on why they're
+-- pre-filled to itemCount length up front rather than appended to
+-- during the build loop), loadedThumbOrder is every index currently
+-- holding a real thumbnail in least- to most-recently-visible order
+-- (a plain LRU queue), and lastVisibleFirstIndex/lastVisibleLastIndex
+-- are the visible range as of the last check, purely so an unchanged
+-- scroll position between ticks is a no-op instead of redoing the same
+-- work five times a second.
+property itemIconViews : {}
+property itemHasRealThumb : {}
+property loadedThumbOrder : {}
+property lastVisibleFirstIndex : 0
+property lastVisibleLastIndex : 0
+property currentColumns : 1
+property currentCellH : 34
+property currentItemsH : 0
+property currentIconSize : 26
+-- 10 columns x 7 rows -- computeLayout's own cap before a grid needs to
+-- scroll at all -- is the largest count that's ever genuinely all
+-- visible at once, so nothing above that needs to stay resident. Not
+-- applied literally as "evict at 71": see updateVisibleThumbnails,
+-- which never evicts anything currently on screen regardless of this
+-- number, so the true ceiling is max(70, current visible count).
+property maxLoadedThumbnails : 70
 -- Once built, activeWindow and its whole view hierarchy (every item's
 -- icon/label/button/menu) are kept alive for the app's lifetime instead
 -- of being destroyed and recreated on every close/reopen: doing that on
@@ -682,6 +717,16 @@ on checkShouldDismiss:sender
         return
     end if
 
+    -- Piggybacked on this same 5x/second timer rather than its own --
+    -- one more scheduledTimer here would be one more thing to invalidate
+    -- correctly on every dismiss/rebuild path, for no real benefit over
+    -- just doing a cheap bit of extra work each existing tick. Wrapped
+    -- in its own try so a bug in here can never take the dismiss-check
+    -- below down with it.
+    try
+        my updateVisibleThumbnails()
+    end try
+
     -- A reopen right after being deactivated reads isActive() as false
     -- for a real 1-1.2+ seconds before settling true (measured), so
     -- dismissing on the first false reading would close the popup
@@ -748,6 +793,13 @@ on presentWindow(win, winW)
     -- rather than 0.
     if my builtNeedsScroll then
         (my builtItemsContainer)'s scrollPoint:{0, my builtItemsH}
+        -- Force the next updateVisibleThumbnails tick to recompute
+        -- rather than trust whatever range was visible when this same
+        -- popup was last closed (real if it had been scrolled down
+        -- before) -- 0/0 can never match a real range, so it always
+        -- looks "changed" once.
+        set my lastVisibleFirstIndex to 0
+        set my lastVisibleLastIndex to 0
     end if
 
     set my hasSeenActiveThisShow to false
@@ -991,7 +1043,7 @@ on buildChrome(layout)
     return {theWindow:theWindow, contentV:contentV, itemsContainer:itemsContainer}
 end buildChrome
 
-on buildItemView(i, itemCount, aName, itemPath, columns, cellW, cellH, itemsH, iconSize, labelFontSize, ws, itemsContainer)
+on buildItemView(i, itemCount, aName, itemPath, columns, cellW, cellH, itemsH, iconSize, labelFontSize, ws, itemsContainer, loadRealThumbNow)
     set nsItemMsg to (current application's NSString's stringWithString:"showFolderMenu: processing item ")
     set nsItemMsg to (nsItemMsg's stringByAppendingString:((i as text) as text))
     set nsItemMsg to (nsItemMsg's stringByAppendingString:" of ")
@@ -1028,12 +1080,23 @@ on buildItemView(i, itemCount, aName, itemPath, columns, cellW, cellH, itemsH, i
     -- (confirmed directly too). So: icon/label as siblings in the
     -- container, then a separate, subview-free, fully transparent
     -- button of the same size layered on top, purely for clicks.
-    set itemIcon to my realThumbnailForPath(itemPath)
-    if itemIcon is missing value then
+    -- Only genuinely on-screen items get a real thumbnail up front --
+    -- everything else gets the cheap generic per-type icon for now and
+    -- picks up its real one later, if and when it's actually scrolled
+    -- into view (see updateVisibleThumbnails). Building 300+ item views
+    -- is fine; decoding 300+ real photos/PDFs before the popup can even
+    -- appear is not.
+    set gotRealThumb to false
+    if loadRealThumbNow then
+        set itemIcon to my realThumbnailForPath(itemPath)
+        if itemIcon is not missing value then
+            my fitImageToSize(itemIcon, iconSize)
+            set gotRealThumb to true
+        end if
+    end if
+    if not gotRealThumb then
         set itemIcon to (ws's iconForFile:itemPath)
         (itemIcon's setSize:{width:iconSize, height:iconSize})
-    else
-        my fitImageToSize(itemIcon, iconSize)
     end if
 
     if my isGridView then
@@ -1058,6 +1121,16 @@ on buildItemView(i, itemCount, aName, itemPath, columns, cellW, cellH, itemsH, i
     (iconView's setImage:itemIcon)
     (iconView's setImageScaling:(current application's NSImageScaleProportionallyUpOrDown))
     (itemsContainer's addSubview:iconView)
+
+    -- Recorded by position (item i of ...), not appended: a failed
+    -- item earlier in the loop (caught by showFolderMenu's per-item
+    -- try) must not shift every later index out of alignment with
+    -- allNames/itemPaths -- both arrays are pre-filled to itemCount
+    -- length before the loop starts specifically so this assignment is
+    -- always valid.
+    set item i of my itemIconViews to iconView
+    set item i of my itemHasRealThumb to gotRealThumb
+    if gotRealThumb then set end of my loadedThumbOrder to i
 
     set labelField to (current application's NSTextField's alloc()'s initWithFrame:{{labelX, labelY}, {labelW, labelH}})
     (labelField's setStringValue:displayName)
@@ -1346,6 +1419,118 @@ on realThumbnailForPath(p)
     return smallImg
 end realThumbnailForPath
 
+on updateVisibleThumbnails()
+    -- Nothing to do for a popup that fits on screen without scrolling
+    -- -- every item was loaded with a real thumbnail up front in that
+    -- case (see the initialVisibleCount note in showFolderMenu), since
+    -- everything really is visible at once and there's no off-screen
+    -- set to defer.
+    if not my builtNeedsScroll then return
+    if my builtItemsContainer is missing value then return
+    set totalItems to (count of my itemIconViews)
+    if totalItems is 0 then return
+
+    set visRect to (my builtItemsContainer)'s visibleRect()
+    set visOrigin to item 1 of visRect
+    set visSize to item 2 of visRect
+    set visY to (item 2 of visOrigin) as real
+    set visH to (item 2 of visSize) as real
+
+    set itemsHVal to my currentItemsH
+    set cellHVal to my currentCellH
+    set columnsVal to my currentColumns
+    if cellHVal <= 0 or columnsVal < 1 then return
+
+    -- itemsContainer isn't flipped -- row 0 (the first items) sits at
+    -- the top, i.e. the highest y (see cellOriginForIndex) -- so a
+    -- larger y is an earlier row, and the visible rect's top edge
+    -- (visY + visH) is where the first visible row is.
+    set topY to visY + visH
+    set bottomY to visY
+    set firstRow to ((itemsHVal - topY) / cellHVal) as integer
+    if firstRow < 0 then set firstRow to 0
+    set lastRow to ((itemsHVal - bottomY) / cellHVal) as integer
+    set maxRow to ((totalItems - 1) div columnsVal)
+    if lastRow > maxRow then set lastRow to maxRow
+    if lastRow < firstRow then set lastRow to firstRow
+
+    set firstIdx to (firstRow * columnsVal) + 1
+    set lastIdx to ((lastRow + 1) * columnsVal)
+    if lastIdx > totalItems then set lastIdx to totalItems
+    if firstIdx < 1 then set firstIdx to 1
+
+    -- Same range as last tick (nothing scrolled) -- nothing to do.
+    -- Cheap early-out so an idle, unscrolled popup does no real work on
+    -- the other 4 out of 5 ticks a second.
+    if firstIdx = (my lastVisibleFirstIndex) and lastIdx = (my lastVisibleLastIndex) then
+        return
+    end if
+    set my lastVisibleFirstIndex to firstIdx
+    set my lastVisibleLastIndex to lastIdx
+
+    -- Load a real thumbnail for anything newly visible that's still
+    -- showing its generic-icon placeholder. A cache hit (the common
+    -- case for anything seen before, in this show or a past one) is
+    -- just reading back a small PNG, so this stays fast even though
+    -- it's running on the main thread mid-scroll.
+    repeat with idx from firstIdx to lastIdx
+        if (item idx of my itemHasRealThumb) is false then
+            set targetView to (item idx of my itemIconViews)
+            if targetView is not missing value then
+                set itemPath to (item idx of my itemPaths)
+                set realImg to my realThumbnailForPath(itemPath)
+                if realImg is not missing value then
+                    my fitImageToSize(realImg, my currentIconSize)
+                    (targetView's setImage:realImg)
+                    set item idx of my itemHasRealThumb to true
+                    set end of my loadedThumbOrder to idx
+                end if
+            end if
+        end if
+    end repeat
+
+    -- Evict the least-recently-visible real thumbnails once over
+    -- budget, swapping each back to the cheap generic icon -- but never
+    -- anything in the current visible range, regardless of budget.
+    --
+    -- A single front-to-back pass, not a pop-the-front-and-give-up-on-
+    -- the-first-still-visible-one loop: that first approach looked
+    -- correct but wasn't -- a re-queued visible entry goes to the back,
+    -- so the front can end up occupied by another visible entry (one
+    -- that was re-queued on an earlier tick) while genuinely stale
+    -- entries sit further back in the same queue, and bailing out at
+    -- that first non-evictable front entry left those later, actually-
+    -- evictable ones untouched (confirmed directly in testing: items
+    -- scrolled fully out of view stayed loaded indefinitely once this
+    -- happened, defeating the whole cap). Evicting the oldest
+    -- evictable entries wherever they fall in the queue, in one pass,
+    -- doesn't have that blind spot.
+    set stillNeeded to (count of my loadedThumbOrder) - (my maxLoadedThumbnails)
+    if stillNeeded > 0 then
+        set keptOrder to {}
+        repeat with idx in (my loadedThumbOrder)
+            set idx to idx as integer
+            if stillNeeded > 0 and (idx < firstIdx or idx > lastIdx) then
+                if (item idx of my itemHasRealThumb) is true then
+                    set targetView to (item idx of my itemIconViews)
+                    if targetView is not missing value then
+                        set itemPath to (item idx of my itemPaths)
+                        set placeholderWs to current application's NSWorkspace's sharedWorkspace()
+                        set placeholderImg to (placeholderWs's iconForFile:itemPath)
+                        (placeholderImg's setSize:{width:(my currentIconSize), height:(my currentIconSize)})
+                        (targetView's setImage:placeholderImg)
+                        set item idx of my itemHasRealThumb to false
+                    end if
+                end if
+                set stillNeeded to stillNeeded - 1
+            else
+                set end of keptOrder to idx
+            end if
+        end repeat
+        set my loadedThumbOrder to keptOrder
+    end if
+end updateVisibleThumbnails
+
 on showFolderMenu()
     -- Reentrancy guard: a "reopen" arriving while a previous call is
     -- still mid-flight (a real risk -- the forced contentV's display()
@@ -1464,6 +1649,23 @@ on showFolderMenu()
         set end of my itemPaths to ((pathsByName's objectForKey:aName) as text)
     end repeat
 
+    -- Reset lazy-thumbnail-loading state for this (re)build. The two
+    -- tracking arrays are pre-filled to itemCount length up front, not
+    -- appended to as the item loop runs, so buildItemView can always
+    -- write to "item i of ..." even if an earlier item in the loop
+    -- failed and was skipped -- see the note there for why that
+    -- matters. missing value / false are safe placeholders: nothing
+    -- reads them for an index whose view was never actually built.
+    set my itemIconViews to {}
+    set my itemHasRealThumb to {}
+    repeat itemCount times
+        set end of my itemIconViews to missing value
+        set end of my itemHasRealThumb to false
+    end repeat
+    set my loadedThumbOrder to {}
+    set my lastVisibleFirstIndex to 0
+    set my lastVisibleLastIndex to 0
+
     set ws to current application's NSWorkspace's sharedWorkspace()
 
     set layout to my computeLayout(itemCount)
@@ -1474,6 +1676,27 @@ on showFolderMenu()
     set labelFontSize to (labelFontSize of layout)
     set itemsH to (itemsH of layout)
     set totalW to (totalW of layout)
+    set my currentColumns to columns
+    set my currentCellH to cellH
+    set my currentItemsH to itemsH
+    set my currentIconSize to iconSize
+
+    -- Only the items that will actually be visible the moment this
+    -- popup appears get a real thumbnail loaded synchronously in the
+    -- build loop below -- everything else starts with the cheap
+    -- generic icon and picks up its real one lazily, on scroll (see
+    -- updateVisibleThumbnails). A popup that fits without scrolling has
+    -- no off-screen items to defer, so everything loads now, same as
+    -- before this existed. +1 row over the strict fit is a small,
+    -- fixed prefetch margin -- covers the sliver of a partially-visible
+    -- row at the bottom of the viewport, not a general scroll buffer.
+    if (needsScroll of layout) then
+        set visRows to (((visibleItemsH of layout) / cellH) as integer) + 1
+        set initialVisibleCount to columns * visRows
+        if initialVisibleCount > itemCount then set initialVisibleCount to itemCount
+    else
+        set initialVisibleCount to itemCount
+    end if
 
     set chrome to my buildChrome(layout)
     set theWindow to (theWindow of chrome)
@@ -1499,7 +1722,8 @@ on showFolderMenu()
       try
         set aName to (item i of allNames) as text
         set itemPath to (item i of my itemPaths)
-        my buildItemView(i, itemCount, aName, itemPath, columns, cellW, cellH, itemsH, iconSize, labelFontSize, ws, itemsContainer)
+        set loadNow to (i <= initialVisibleCount)
+        my buildItemView(i, itemCount, aName, itemPath, columns, cellW, cellH, itemsH, iconSize, labelFontSize, ws, itemsContainer, loadNow)
       on error errMsg number errNum
         my logEvent("showFolderMenu: item at index " & i & " failed, skipping: " & errNum & ": " & errMsg)
       end try
