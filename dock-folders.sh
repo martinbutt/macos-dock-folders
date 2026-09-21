@@ -14,6 +14,7 @@ DEFAULT_OUTPUT_DIR="$SCRIPT_DIR/build"
 OUTPUT_DIR=""
 ALL_MODE=false
 VIEW_MODE="list"
+DEBUG_LOGGING=true
 FOLDERS=()
 
 # Resolves $1 to an absolute, real path -- prints it and returns success,
@@ -206,6 +207,10 @@ Options:
                          one of the folders is shown once, from whichever
                          folder is listed first. Repeatable, for more than
                          one combined app.
+  --no-debug-log         Don't write to the shared diagnostic log at
+                         ~/Library/Application Support/dock-folders/debug.log
+                         (default: on -- capped at 2MB, but still a file
+                         on disk some users may not want)
   -h, --help             Show this help
 
 Examples:
@@ -214,6 +219,7 @@ Examples:
   $(basename "$0") --output-dir ~/Desktop ~/Documents/my-folder
   $(basename "$0") --view grid ~/Documents/dock-folders/coding
   $(basename "$0") --combine "Applications=/Applications,/System/Applications"
+  $(basename "$0") --no-debug-log ~/Documents/dock-folders/coding
 EOF
     exit 0
 }
@@ -247,6 +253,10 @@ while [[ $# -gt 0 ]]; do
         --combine)
             COMBINE_SPECS+=("$2")
             shift 2
+            ;;
+        --no-debug-log)
+            DEBUG_LOGGING=false
+            shift
             ;;
         -h|--help)
             usage
@@ -512,10 +522,12 @@ generate_applescript() {
     local grid_spacing="$6" # likewise
     local debug_log_path="$7"
     local thumb_cache_dir="$8"
-    local folder_name_esc debug_log_path_esc thumb_cache_dir_esc
+    local debug_logging_enabled="$9" # "true" or "false" -- a trusted literal, not escaped text
+    local folder_name_esc debug_log_path_esc thumb_cache_dir_esc debug_logging_enabled_literal
     folder_name_esc="$(applescript_escape "$folder_name")"
     debug_log_path_esc="$(applescript_escape "$debug_log_path")"
     thumb_cache_dir_esc="$(applescript_escape "$thumb_cache_dir")"
+    debug_logging_enabled_literal="$debug_logging_enabled"
 
     # Build the AppleScript list literal for sourceFolderPaths, e.g.
     # {"/Applications", "/System/Applications"} -- each path individually
@@ -555,6 +567,7 @@ property keepAliveActivity : missing value
 property hasSeenActiveThisShow : false
 property inactiveStreak : 0
 property debugLogPath : "$debug_log_path_esc"
+property debugLoggingEnabled : $debug_logging_enabled_literal
 property thumbCacheDir : "$thumb_cache_dir_esc"
 -- Fixed resolution real item thumbnails are generated/cached at,
 -- independent of the current display size (list view's small icon vs.
@@ -629,6 +642,7 @@ on logEvent(msg)
     -- AppleScript's own legacy string engine has a real memory-corruption
     -- bug under sustained repeated use in a long-lived process, and this
     -- handler runs on every single log call across the app's lifetime.
+    if not my debugLoggingEnabled then return
     try
         set fm to current application's NSFileManager's defaultManager()
         set logDir to ((current application's NSString's stringWithString:(my debugLogPath))'s stringByDeletingLastPathComponent())
@@ -1907,7 +1921,7 @@ for spec in "${APP_SPECS[@]}"; do
 
     # 1. Generate AppleScript source
     tmp_script="$build_dir/app.applescript"
-    generate_applescript "$folder_paths_csv" "$folder_name" "$IS_GRID_LITERAL" "$grid_icon_size" "$grid_text_size" "$grid_spacing" "$PREWARM_SUPPORT_DIR/debug.log" "$THUMB_CACHE_DIR" > "$tmp_script"
+    generate_applescript "$folder_paths_csv" "$folder_name" "$IS_GRID_LITERAL" "$grid_icon_size" "$grid_text_size" "$grid_spacing" "$PREWARM_SUPPORT_DIR/debug.log" "$THUMB_CACHE_DIR" "$DEBUG_LOGGING" > "$tmp_script"
 
     # 2. Compile to .app bundle (stay-open so it handles reopen events)
     echo "  ⚙ Compiling app..."
