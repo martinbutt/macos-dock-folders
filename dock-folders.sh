@@ -380,6 +380,14 @@ check_output_dir_safety "$OUTPUT_DIR"
 echo "🔁 Setting up login-time warm-up for generated apps..."
 ensure_prewarm_login_agent
 
+# On-disk cache of downsized item thumbnails (real photo/PDF previews,
+# keyed by source path + mtime + size), shared by every generated app.
+# Without it, each app decodes every image/PDF in its folder at full
+# resolution on every popup build and never releases it -- for a folder
+# with a few hundred photos that's easily north of a gigabyte of RSS.
+THUMB_CACHE_DIR="$PREWARM_SUPPORT_DIR/thumbnails"
+mkdir -p "$THUMB_CACHE_DIR"
+
 # ─── Icon extraction ────────────────────────────────────────────────────────────
 # Extracts the folder's rendered icon (including custom emoji + color) as .icns
 create_icns() {
@@ -503,9 +511,11 @@ generate_applescript() {
     local grid_text_size="$5" # likewise
     local grid_spacing="$6" # likewise
     local debug_log_path="$7"
-    local folder_name_esc debug_log_path_esc
+    local thumb_cache_dir="$8"
+    local folder_name_esc debug_log_path_esc thumb_cache_dir_esc
     folder_name_esc="$(applescript_escape "$folder_name")"
     debug_log_path_esc="$(applescript_escape "$debug_log_path")"
+    thumb_cache_dir_esc="$(applescript_escape "$thumb_cache_dir")"
 
     # Build the AppleScript list literal for sourceFolderPaths, e.g.
     # {"/Applications", "/System/Applications"} -- each path individually
@@ -545,6 +555,15 @@ property keepAliveActivity : missing value
 property hasSeenActiveThisShow : false
 property inactiveStreak : 0
 property debugLogPath : "$debug_log_path_esc"
+property thumbCacheDir : "$thumb_cache_dir_esc"
+-- Fixed resolution real item thumbnails are generated/cached at,
+-- independent of the current display size (list view's small icon vs.
+-- grid view's larger one) -- see realThumbnailForPath. Large enough to
+-- stay sharp at a Retina 2x pixel density for the largest icon size
+-- Finder's own grid-icon-size setting realistically produces, small
+-- enough to keep per-item memory in the hundreds-of-KB range instead
+-- of the tens-of-MB a native-resolution photo decodes to.
+property thumbCacheSize : 384
 property isBuildingMenu : false
 -- Once built, activeWindow and its whole view hierarchy (every item's
 -- icon/label/button/menu) are kept alive for the app's lifetime instead
@@ -1009,7 +1028,7 @@ on buildItemView(i, itemCount, aName, itemPath, columns, cellW, cellH, itemsH, i
     -- (confirmed directly too). So: icon/label as siblings in the
     -- container, then a separate, subview-free, fully transparent
     -- button of the same size layered on top, purely for clicks.
-    set itemIcon to my realThumbnailForPath(itemPath, iconSize)
+    set itemIcon to my realThumbnailForPath(itemPath)
     if itemIcon is missing value then
         set itemIcon to (ws's iconForFile:itemPath)
         (itemIcon's setSize:{width:iconSize, height:iconSize})
@@ -1151,7 +1170,9 @@ on fitImageToSize(img, targetSize)
     -- chosen icon size, unlike the generic per-type icons (already
     -- explicitly sized) -- scale it down to fit within targetSize on
     -- its longer edge, preserving aspect ratio, so it actually honors
-    -- the same icon size everything else uses.
+    -- the same icon size everything else uses. img is already a small,
+    -- resampled thumbnail (see resampleToSquare) by the time this runs,
+    -- so this is a cheap cosmetic resize, not a memory concern.
     set nativeSize to img's |size|()
     set nw to (nativeSize's width) as real
     set nh to (nativeSize's height) as real
@@ -1163,14 +1184,111 @@ on fitImageToSize(img, targetSize)
     end if
 end fitImageToSize
 
-on realThumbnailForPath(p, targetSize)
+on resampleToSquare(img, targetSize)
+    -- Draws img -- at whatever its native size is -- into a freshly
+    -- allocated small bitmap, scaled to fit within targetSize x
+    -- targetSize (preserving aspect ratio, centered). This is a real
+    -- resample, not the cosmetic setSize: in fitImageToSize above: the
+    -- returned image's actual pixel data is small, so the caller can
+    -- drop a huge original right after this returns and only the small
+    -- bitmap stays resident -- the difference between one photo costing
+    -- a few hundred KB in memory versus tens of megabytes.
+    set nativeSize to img's |size|()
+    set nw to (nativeSize's width) as real
+    set nh to (nativeSize's height) as real
+    if nw <= 0 or nh <= 0 then return missing value
+    set scale to targetSize / nw
+    set scaleH to targetSize / nh
+    if scaleH < scale then set scale to scaleH
+    set dw to nw * scale
+    set dh to nh * scale
+    set dx to (targetSize - dw) / 2
+    set dy to (targetSize - dh) / 2
+
+    set smallRep to (current application's NSBitmapImageRep's alloc()'s initWithBitmapDataPlanes:(missing value) pixelsWide:targetSize pixelsHigh:targetSize bitsPerSample:8 samplesPerPixel:4 hasAlpha:true isPlanar:false colorSpaceName:(current application's NSCalibratedRGBColorSpace) bytesPerRow:0 bitsPerPixel:0)
+    set smallCtx to (current application's NSGraphicsContext's graphicsContextWithBitmapImageRep:smallRep)
+    current application's NSGraphicsContext's setCurrentContext:smallCtx
+    img's drawInRect:{origin:{x:dx, y:dy}, |size|:{width:dw, height:dh}}
+    current application's NSGraphicsContext's setCurrentContext:(missing value)
+
+    set smallImg to (current application's NSImage's alloc()'s initWithSize:{width:targetSize, height:targetSize})
+    smallImg's addRepresentation:smallRep
+    return smallImg
+end resampleToSquare
+
+on thumbCacheFileForPath(p)
+    -- Cache key: the full path (so two same-named files in different
+    -- folders don't collide), sanitized, plus the file's modification
+    -- time and size (so an edited file gets a fresh entry instead of
+    -- serving a stale thumbnail -- the old entry is simply never
+    -- touched again, not actively pruned). missing value means "don't
+    -- cache this one" (attributes unavailable), not an error -- the
+    -- caller just skips the cache and falls through to generating it
+    -- fresh.
+    --
+    -- Deliberately NOT NSString's hash(): that returns a 64-bit
+    -- NSUInteger, and AppleScript can only hold a value that large as
+    -- a double once it crosses back from Objective-C -- confirmed
+    -- directly, the precision loss happens the moment the raw hash is
+    -- read into a plain variable, not just when formatting it
+    -- afterward, silently truncating it to a handful of significant
+    -- digits and defeating the entire point of hashing for collision
+    -- avoidance (it broke item processing outright in testing: two
+    -- items landing on the same truncated "hash" trips the later
+    -- write's "already exists"/permissions edge cases). The sanitized
+    -- full path has no such ceiling.
+    set fm to current application's NSFileManager's defaultManager()
+    set attrs to (fm's attributesOfItemAtPath:p |error|:(missing value))
+    if attrs is missing value then return missing value
+    set modDate to (attrs's objectForKey:(current application's NSFileModificationDate))
+    set fileSizeNum to (attrs's objectForKey:(current application's NSFileSize))
+    if modDate is missing value or fileSizeNum is missing value then return missing value
+    set modEpoch to ((modDate's timeIntervalSince1970()) as integer)
+    set fileSizeInt to (fileSizeNum as integer)
+
+    set nsPath to (current application's NSString's stringWithString:p)
+    set sanitized to (nsPath's stringByReplacingOccurrencesOfString:"/" withString:"_") as text
+    -- A very deep path could exceed the filesystem's per-component name
+    -- limit once the mtime/size suffix is added -- keep just the tail
+    -- (the filename and its closest parents, the most distinguishing
+    -- part) if so.
+    if (length of sanitized) > 150 then
+        set sanitized to (text -150 thru -1 of sanitized)
+    end if
+    set cacheFileName to sanitized & "-" & modEpoch & "-" & fileSizeInt & ".png"
+    return (my thumbCacheDir) & "/" & cacheFileName
+end thumbCacheFileForPath
+
+on realThumbnailForPath(p)
     -- NSWorkspace's iconForFile: mostly returns the generic per-type
     -- icon (with a small extension badge), not a real content preview
     -- the way Finder's own icon view renders one -- load the real
     -- content directly for the types where that matters visually.
+    --
+    -- Always generated/cached at the one fixed thumbCacheSize
+    -- (independent of the caller's requested display size, list vs.
+    -- grid) so the same on-disk thumbnail is reused across both views
+    -- instead of keeping a separate cache entry per view; fitImageToSize
+    -- at the call site handles the (cheap, since this is already small)
+    -- cosmetic fit down to whatever size is actually being displayed.
+    set cacheFile to my thumbCacheFileForPath(p)
+
+    if cacheFile is not missing value then
+        set fm to current application's NSFileManager's defaultManager()
+        if (fm's fileExistsAtPath:cacheFile) then
+            try
+                set cachedURL to (current application's NSURL's fileURLWithPath:cacheFile)
+                set cachedImg to (current application's NSImage's alloc()'s initWithContentsOfURL:cachedURL)
+                if cachedImg is not missing value then return cachedImg
+            end try
+        end if
+    end if
+
     set fileURL to current application's NSURL's fileURLWithPath:p
     set ext to ((fileURL's pathExtension())'s lowercaseString()) as text
     set imageExts to {"png", "jpg", "jpeg", "gif", "tiff", "tif", "heic", "heif", "bmp", "webp"}
+    set rawImg to missing value
+
     if imageExts contains ext then
         try
             -- Skip decoding unusually large images synchronously on the
@@ -1186,8 +1304,7 @@ on realThumbnailForPath(p, targetSize)
                 if fileSizeNum is not missing value then set fileSize to (fileSizeNum as integer)
             end if
             if fileSize < 20000000 then
-                set img to (current application's NSImage's alloc()'s initWithContentsOfURL:fileURL)
-                if img is not missing value then return img
+                set rawImg to (current application's NSImage's alloc()'s initWithContentsOfURL:fileURL)
             end if
         end try
     else if ext is "pdf" then
@@ -1197,14 +1314,36 @@ on realThumbnailForPath(p, targetSize)
                 if (pdfDoc's pageCount()) > 0 then
                     set pdfPage to (pdfDoc's pageAtIndex:0)
                     if pdfPage is not missing value then
-                        set thumb to (pdfPage's thumbnailOfSize:{width:targetSize, height:targetSize} forBox:(current application's kPDFDisplayBoxCropBox))
-                        if thumb is not missing value then return thumb
+                        set rawImg to (pdfPage's thumbnailOfSize:{width:(my thumbCacheSize), height:(my thumbCacheSize)} forBox:(current application's kPDFDisplayBoxCropBox))
                     end if
                 end if
             end if
         end try
     end if
-    return missing value
+
+    if rawImg is missing value then return missing value
+
+    -- The real fix: resample down to the fixed cache size right away,
+    -- then drop rawImg -- so a 12MP photo's full decode is a brief,
+    -- transient allocation freed within this handler, not something
+    -- that stays resident for as long as the app keeps running (which
+    -- is indefinitely -- see the note on activeWindow near the top of
+    -- this file).
+    set smallImg to my resampleToSquare(rawImg, my thumbCacheSize)
+    set rawImg to missing value
+    if smallImg is missing value then return missing value
+
+    if cacheFile is not missing value then
+        try
+            set smallRepForSave to ((smallImg's representations())'s firstObject())
+            set pngData to (smallRepForSave's representationUsingType:4 |properties|:(missing value))
+            if pngData is not missing value then
+                (pngData's writeToFile:cacheFile atomically:true)
+            end if
+        end try
+    end if
+
+    return smallImg
 end realThumbnailForPath
 
 on showFolderMenu()
@@ -1544,7 +1683,7 @@ for spec in "${APP_SPECS[@]}"; do
 
     # 1. Generate AppleScript source
     tmp_script="$build_dir/app.applescript"
-    generate_applescript "$folder_paths_csv" "$folder_name" "$IS_GRID_LITERAL" "$grid_icon_size" "$grid_text_size" "$grid_spacing" "$PREWARM_SUPPORT_DIR/debug.log" > "$tmp_script"
+    generate_applescript "$folder_paths_csv" "$folder_name" "$IS_GRID_LITERAL" "$grid_icon_size" "$grid_text_size" "$grid_spacing" "$PREWARM_SUPPORT_DIR/debug.log" "$THUMB_CACHE_DIR" > "$tmp_script"
 
     # 2. Compile to .app bundle (stay-open so it handles reopen events)
     echo "  ⚙ Compiling app..."
