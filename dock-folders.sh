@@ -16,6 +16,19 @@ ALL_MODE=false
 VIEW_MODE="list"
 FOLDERS=()
 
+# Resolves $1 to an absolute, real path -- prints it and returns success,
+# or prints nothing and fails if it isn't an existing directory. "--" and
+# an unset CDPATH keep an odd-looking value (a bare "-", or a name that
+# happens to match a CDPATH entry) from resolving to somewhere other than
+# the literal path given; -P (not -L) follows a symlinked folder to where
+# it actually points. A leading "~" is expanded first, since a value that
+# arrived pre-quoted (e.g. inside a --combine argument) never got that
+# from the shell the way a bare positional argument normally would.
+resolve_existing_dir() {
+    local raw="${1/#\~/$HOME}"
+    ( unset CDPATH; cd -P -- "$raw" 2>/dev/null && pwd -P )
+}
+
 # Escapes a string for safe embedding inside an AppleScript double-quoted
 # string literal. Folder/file names may legally contain characters (", \)
 # that would otherwise let untrusted filenames break out of the literal and
@@ -180,20 +193,32 @@ Usage: $(basename "$0") [OPTIONS] FOLDER [FOLDER ...]
 Generate .app wrappers for folders so their custom icons show in the macOS Dock.
 
 Options:
-  --output-dir DIR   Where to place generated .app bundles
-                     (default: ./build, next to this script)
-  --all DIR          Process all subdirectories within DIR
-  --view MODE        Popup layout: "list" or "grid" (default: list)
-  -h, --help         Show this help
+  --output-dir DIR       Where to place generated .app bundles
+                         (default: ./build, next to this script)
+  --all DIR              Process all subdirectories within DIR
+  --view MODE            Popup layout: "list" or "grid" (default: list)
+  --combine NAME=DIR,DIR[,DIR...]
+                         Show two or more real folders as one combined app
+                         named NAME -- e.g. /Applications and
+                         /System/Applications appearing as a single
+                         "Applications" Dock icon. Contents are merged and
+                         sorted together; a name that exists in more than
+                         one of the folders is shown once, from whichever
+                         folder is listed first. Repeatable, for more than
+                         one combined app.
+  -h, --help             Show this help
 
 Examples:
   $(basename "$0") ~/Documents/dock-folders/coding
   $(basename "$0") --all ~/Documents/dock-folders
   $(basename "$0") --output-dir ~/Desktop ~/Documents/my-folder
   $(basename "$0") --view grid ~/Documents/dock-folders/coding
+  $(basename "$0") --combine "Applications=/Applications,/System/Applications"
 EOF
     exit 0
 }
+
+COMBINE_SPECS=()
 
 NO_MORE_OPTIONS=false
 while [[ $# -gt 0 ]]; do
@@ -217,6 +242,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --view)
             VIEW_MODE="$2"
+            shift 2
+            ;;
+        --combine)
+            COMBINE_SPECS+=("$2")
             shift 2
             ;;
         -h|--help)
@@ -256,8 +285,77 @@ if $ALL_MODE; then
     done < <(find "$PARENT_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0 | sort -z)
 fi
 
-if [[ ${#FOLDERS[@]} -eq 0 ]]; then
+if [[ ${#FOLDERS[@]} -eq 0 && ${#COMBINE_SPECS[@]} -eq 0 ]]; then
     echo "Error: No folders specified. Use -h for help."
+    exit 1
+fi
+
+# Build the list of apps to generate: one entry per app, encoded as
+# "NAME<TAB>path1,path2,...". A plain folder becomes an app named for
+# itself, backed by that one real folder; a --combine spec becomes an
+# app named as specified, backed by however many real folders it lists.
+# Unifying both into one shape here (instead of treating them as two
+# separate cases) means the main loop below doesn't need to know the
+# difference.
+APP_SPECS=()
+
+# Guarded by a count check, not just iterated directly: macOS's stock
+# /bin/bash is 3.2, where "${arr[@]}" on a declared-but-empty array
+# throws "unbound variable" under "set -u" -- and unlike FOLDERS before
+# this feature existed, either of these two can now legitimately be
+# empty (a run using only --combine has no plain FOLDERS, and vice
+# versa) rather than always having been checked non-empty already.
+if [[ ${#FOLDERS[@]} -gt 0 ]]; then
+    for folder in "${FOLDERS[@]}"; do
+        if ! resolved="$(resolve_existing_dir "$folder")"; then
+            echo "⚠ Skipping '$folder' — not a directory"
+            continue
+        fi
+        APP_SPECS+=("$(basename "$resolved")"$'\t'"$resolved")
+    done
+fi
+
+if [[ ${#COMBINE_SPECS[@]} -gt 0 ]]; then
+    for spec in "${COMBINE_SPECS[@]}"; do
+        if [[ "$spec" != *=* ]]; then
+            echo "Error: --combine must look like NAME=DIR,DIR[,DIR...] (got '$spec')" >&2
+            exit 1
+        fi
+        combine_name="${spec%%=*}"
+        combine_paths_raw="${spec#*=}"
+        if [[ -z "$combine_name" ]]; then
+            echo "Error: --combine is missing a name (got '$spec')" >&2
+            exit 1
+        fi
+        resolved_paths=""
+        remaining="$combine_paths_raw"
+        while [[ -n "$remaining" ]]; do
+            one="${remaining%%,*}"
+            if [[ "$remaining" == *,* ]]; then
+                remaining="${remaining#*,}"
+            else
+                remaining=""
+            fi
+            [[ -n "$one" ]] || continue
+            if ! one_resolved="$(resolve_existing_dir "$one")"; then
+                echo "⚠ --combine '$combine_name': skipping '$one' — not a directory" >&2
+                continue
+            fi
+            if [[ -n "$resolved_paths" ]]; then
+                resolved_paths+=","
+            fi
+            resolved_paths+="$one_resolved"
+        done
+        if [[ -z "$resolved_paths" ]]; then
+            echo "⚠ --combine '$combine_name': no valid folders, skipping" >&2
+            continue
+        fi
+        APP_SPECS+=("$combine_name"$'\t'"$resolved_paths")
+    done
+fi
+
+if [[ ${#APP_SPECS[@]} -eq 0 ]]; then
+    echo "Error: No valid folders to build. Use -h for help."
     exit 1
 fi
 
@@ -397,17 +495,39 @@ ICONSCRIPT
 
 # ─── AppleScript template ───────────────────────────────────────────────────────
 generate_applescript() {
-    local folder_path="$1"
+    local folder_paths_csv="$1" # one or more real absolute paths, comma-separated --
+                                 # a single-folder app is just the one-path case
     local folder_name="$2"
     local is_grid="$3" # "true" or "false" -- a trusted literal, not escaped text
     local grid_icon_size="$4" # from Finder's own icon-view settings -- a plain integer
     local grid_text_size="$5" # likewise
     local grid_spacing="$6" # likewise
     local debug_log_path="$7"
-    local folder_path_esc folder_name_esc debug_log_path_esc
-    folder_path_esc="$(applescript_escape "$folder_path")"
+    local folder_name_esc debug_log_path_esc
     folder_name_esc="$(applescript_escape "$folder_name")"
     debug_log_path_esc="$(applescript_escape "$debug_log_path")"
+
+    # Build the AppleScript list literal for sourceFolderPaths, e.g.
+    # {"/Applications", "/System/Applications"} -- each path individually
+    # escaped the same way every other string is before it's embedded in
+    # the generated source. Split via parameter expansion, not IFS word-
+    # splitting -- no dependency on IFS actually being what's expected.
+    local source_folder_paths_literal="" one_path one_path_esc
+    local remaining_paths="$folder_paths_csv"
+    while [[ -n "$remaining_paths" ]]; do
+        one_path="${remaining_paths%%,*}"
+        if [[ "$remaining_paths" == *,* ]]; then
+            remaining_paths="${remaining_paths#*,}"
+        else
+            remaining_paths=""
+        fi
+        [[ -n "$one_path" ]] || continue
+        one_path_esc="$(applescript_escape "$one_path")"
+        if [[ -n "$source_folder_paths_literal" ]]; then
+            source_folder_paths_literal+=", "
+        fi
+        source_folder_paths_literal+="\"$one_path_esc\""
+    done
 
     cat <<APPLESCRIPT
 use framework "AppKit"
@@ -415,6 +535,7 @@ use framework "Foundation"
 use framework "PDFKit"
 use scripting additions
 
+property sourceFolderPaths : {$source_folder_paths_literal}
 property itemPaths : {}
 property currentFolderPath : ""
 property isGridView : $is_grid
@@ -617,6 +738,48 @@ on presentWindow(win, winW)
     set my dismissTimer to (current application's NSTimer's scheduledTimerWithTimeInterval:0.2 target:me selector:"checkShouldDismiss:" userInfo:(missing value) repeats:true)
     set my popupVisible to true
 end presentWindow
+
+on listCombinedFolder(sourcePaths)
+    -- Enumerated via NSFileManager, not AppleScript's "list folder" --
+    -- "list folder" returns names in HFS form, where a POSIX ":" in a
+    -- filename comes back as "/". A file named "Important:Report.pdf"
+    -- would then resolve to a DIFFERENT real file if a folder also
+    -- happened to have a matching path -- and every action in this
+    -- popup, including Move to Trash, would act on that real file
+    -- instead of the one shown. NSFileManager returns real POSIX names
+    -- and real POSIX paths directly (via |path|()), so that can't
+    -- happen. (This is still the first thing that touches a
+    -- TCC-protected folder -- see the activate call in showFolderMenu.)
+    --
+    -- Takes one or more source folders and merges their contents into
+    -- a single listing -- a plain single-folder app is just the
+    -- one-source case of the same mechanism. A name that exists in
+    -- more than one source folder is kept only once, from whichever
+    -- source is listed first; one unreadable source (a removable
+    -- volume that isn't mounted, say) doesn't stop the others from
+    -- still being listed.
+    set fm to current application's NSFileManager's defaultManager()
+    set foundNames to {}
+    set pathsByName to current application's NSMutableDictionary's dictionary()
+    set anySourceReadable to false
+    repeat with sp in sourcePaths
+        try
+            set folderURL to (current application's NSURL's fileURLWithPath:(sp as text) isDirectory:true)
+            set contentsURLs to (fm's contentsOfDirectoryAtURL:folderURL includingPropertiesForKeys:{} options:(current application's NSDirectoryEnumerationSkipsHiddenFiles) |error|:(missing value))
+            if contentsURLs is not missing value then
+                set anySourceReadable to true
+                repeat with u in contentsURLs
+                    set oneName to ((u's lastPathComponent()) as text)
+                    if (pathsByName's objectForKey:oneName) is missing value then
+                        set end of foundNames to oneName
+                        (pathsByName's setObject:((u's |path|()) as text) forKey:oneName)
+                    end if
+                end repeat
+            end if
+        end try
+    end repeat
+    return {names:foundNames, pathsByName:pathsByName, anyReadable:anySourceReadable}
+end listCombinedFolder
 
 on ceilSqrt(n)
     -- Smallest integer i such that i*i >= n. Used to pick a roughly
@@ -1092,33 +1255,23 @@ on showFolderMenu()
     -- leaving the permission check to resolve it mid-call.
     (current application's NSApp's activateIgnoringOtherApps:true)
 
-    set folderPath to "$folder_path_esc"
-    set my currentFolderPath to folderPath
+    -- currentFolderPath is the first source folder -- used for "Show in
+    -- Finder" (the footer button / grid's trailing slot) and in error
+    -- messages. A combined app's individual items still resolve to
+    -- their own real source folder regardless (see itemPaths below);
+    -- this is only the one general "reveal the source" fallback.
+    set my currentFolderPath to (item 1 of my sourceFolderPaths)
 
-    -- Enumerated via NSFileManager, not AppleScript's "list folder" --
-    -- "list folder" returns names in HFS form, where a POSIX ":" in a
-    -- filename comes back as "/". A file named "Important:Report.pdf"
-    -- would then resolve (via folderPath's own "/" joining) to a
-    -- DIFFERENT real file if the folder also happened to have a
-    -- matching path -- and every action in this popup, including Move
-    -- to Trash, would act on that real file instead of the one shown.
-    -- NSFileManager returns real POSIX names, so that can't happen.
-    -- (This is still the first thing that touches the TCC-protected
-    -- folder -- see the activate call just above.)
-    my logEvent("showFolderMenu: listing " & folderPath)
-    set fm to current application's NSFileManager's defaultManager()
-    set folderURL to (current application's NSURL's fileURLWithPath:folderPath isDirectory:true)
-    set contentsURLs to (fm's contentsOfDirectoryAtURL:folderURL includingPropertiesForKeys:{} options:(current application's NSDirectoryEnumerationSkipsHiddenFiles) |error|:(missing value))
-    if contentsURLs is missing value then
+    my logEvent("showFolderMenu: listing " & (count of my sourceFolderPaths) & " source folder(s)")
+    set listing to my listCombinedFolder(my sourceFolderPaths)
+    if not (anyReadable of listing) then
         my logEvent("showFolderMenu: listing FAILED")
-        display dialog "Cannot read folder: " & folderPath buttons {"OK"} default button "OK" with icon caution
+        display dialog "Cannot read folder: " & (my currentFolderPath) buttons {"OK"} default button "OK" with icon caution
         set my isBuildingMenu to false
         return
     end if
-    set allNames to {}
-    repeat with u in contentsURLs
-        set end of allNames to ((u's lastPathComponent()) as text)
-    end repeat
+    set allNames to (names of listing)
+    set pathsByName to (pathsByName of listing)
 
     -- Sort names alphabetically (A-Z, case-insensitive) using Cocoa
     set cocoaArray to current application's NSMutableArray's arrayWithArray:allNames
@@ -1163,14 +1316,13 @@ on showFolderMenu()
     try
     set itemCount to count of allNames
     set my itemPaths to {}
-    set nsFolderPath to (current application's NSString's stringWithString:folderPath)
     repeat with aName in allNames
-        -- Built via NSString's own path-joining, not "&": this loop runs
-        -- once per item (often 50+ times per click) and native AppleScript
-        -- concatenation at that frequency is what corrupts the legacy
-        -- string engine (see logEvent above for the full explanation).
-        set nsItemPath to (nsFolderPath's stringByAppendingPathComponent:(current application's NSString's stringWithString:(aName as text)))
-        set end of my itemPaths to (nsItemPath as text)
+        -- The real path came directly from listCombinedFolder's own
+        -- enumeration (see the note there), not rebuilt by joining a
+        -- single folder path with the name -- there's no longer one
+        -- single folder to join against, now that a name can have come
+        -- from any of sourceFolderPaths.
+        set end of my itemPaths to ((pathsByName's objectForKey:aName) as text)
     end repeat
 
     set ws to current application's NSWorkspace's sharedWorkspace()
@@ -1330,22 +1482,17 @@ echo "🗂  Dock Folders Generator"
 echo "   Output: $OUTPUT_DIR"
 echo ""
 
-for folder in "${FOLDERS[@]}"; do
-    # Resolve to an absolute, real path. Unsetting CDPATH stops a name
-    # that happens to match a CDPATH entry from resolving somewhere
-    # other than the literal path given; "--" stops a value like "-"
-    # from being read as an option to cd itself; -P (not -L) resolves
-    # a symlinked folder to where it actually points. Testing the
-    # command directly in the "if" (rather than assigning first and
-    # checking -d after) also means a failure here doesn't trip
-    # "set -e" and abort the whole run instead of just skipping this
-    # one folder.
-    if ! folder="$(unset CDPATH; cd -P -- "$folder" 2>/dev/null && pwd -P)"; then
-        echo "⚠ Skipping '$folder' — not a directory"
-        continue
-    fi
+for spec in "${APP_SPECS[@]}"; do
+    # Each spec is "NAME<TAB>path1,path2,..." -- already resolved to
+    # absolute, real paths when APP_SPECS was built above, so there's
+    # nothing left to validate here regardless of whether this is a
+    # plain single folder or a --combine group.
+    IFS=$'\t' read -r folder_name folder_paths_csv <<< "$spec"
+    # First path only: what a combined app's icon and (if extraction
+    # fails) fallback default should come from -- there's no single real
+    # folder to derive one from otherwise.
+    icon_source_path="${folder_paths_csv%%,*}"
 
-    folder_name="$(basename "$folder")"
     app_name="${folder_name}.app"
     app_path="$OUTPUT_DIR/$app_name"
 
@@ -1397,7 +1544,7 @@ for folder in "${FOLDERS[@]}"; do
 
     # 1. Generate AppleScript source
     tmp_script="$build_dir/app.applescript"
-    generate_applescript "$folder" "$folder_name" "$IS_GRID_LITERAL" "$grid_icon_size" "$grid_text_size" "$grid_spacing" "$PREWARM_SUPPORT_DIR/debug.log" > "$tmp_script"
+    generate_applescript "$folder_paths_csv" "$folder_name" "$IS_GRID_LITERAL" "$grid_icon_size" "$grid_text_size" "$grid_spacing" "$PREWARM_SUPPORT_DIR/debug.log" > "$tmp_script"
 
     # 2. Compile to .app bundle (stay-open so it handles reopen events)
     echo "  ⚙ Compiling app..."
@@ -1408,7 +1555,7 @@ for folder in "${FOLDERS[@]}"; do
     echo "  🎨 Extracting folder icon..."
     tmp_icns="$build_dir/icon.icns"
 
-    if create_icns "$folder" "$tmp_icns"; then
+    if create_icns "$icon_source_path" "$tmp_icns"; then
         cp "$tmp_icns" "$build_app_path/Contents/Resources/applet.icns"
         # Remove the asset catalog — it contains the default applet icon and
         # takes precedence over applet.icns on modern macOS
